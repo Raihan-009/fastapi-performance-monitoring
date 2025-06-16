@@ -1,39 +1,56 @@
-# Fastapi-performance-monitoring
+# FastAPI Performance Monitoring
 
+A comprehensive guide to implementing custom metrics and monitoring in FastAPI applications using Prometheus.
 
-## Here’s what happens, step by step, every time an HTTP request comes into our FastAPI app, and how our custom metrics get updated via the middleware:
+## Table of Contents
 
-1. The Middleware Hook
+1. [HTTP Request Monitoring](#http-request-monitoring)
+2. [Default System Metrics](#default-system-metrics)
+3. [Database Performance Monitoring](#database-performance-monitoring)
+4. [Implementation Details](#implementation-details)
 
-We registered a middleware on the "http" event:
+---
+
+## HTTP Request Monitoring
+
+### Overview
+
+Our FastAPI application implements comprehensive HTTP request monitoring through custom middleware that tracks three key metrics for every incoming request.
+
+### The Middleware Architecture
+
+We registered a middleware on the "http" event that intercepts every request:
+
 ```python
 @app.middleware("http")
 async def metrics_middleware(request: Request, call_next):
-    …
+    # Monitoring logic here
 ```
-FastAPI ensures that every incoming request—regardless of path or method—passes through this function before reaching your actual route handler, and then again after the handler finishes. FastAPI is built on Starlette, which implements the ASGI specification. Our app ends up looking like:
 
-```bash
+FastAPI ensures that every incoming request—regardless of path or method—passes through this function before reaching your actual route handler, and then again after the handler finishes. FastAPI is built on Starlette, which implements the ASGI specification. Our app's request flow looks like:
+
+```
 metrics_middleware → other middlewares → router → route handler
 ```
 
-2. In-Progress Gauge (inprogress_requests)
+### HTTP Metrics Breakdown
+
+#### 1. In-Progress Requests Gauge (`inprogress_requests`)
+
 ```python
-IN_PROGRESS.inc()
+IN_PROGRESS.inc()  # On request start
+# ... process request ...
+IN_PROGRESS.dec()  # On request completion
 ```
-- When? Immediately as the request enters the middleware.
 
-- What it measures? The current number of requests being handled concurrently.
+- **When measured**: Immediately as the request enters the middleware
+- **What it tracks**: Current number of requests being handled concurrently
+- **How it works**: 
+  - `.inc()` adds 1 to the gauge when request starts
+  - `.dec()` subtracts 1 when request completes
+- **Use case**: Monitor application load and detect traffic spikes
 
-- How?
-
-    - .inc() adds 1 to the gauge.
-
-    - Later, after the request completes, .dec() subtracts 1.
-
-- Result: At any given moment, inprogress_requests shows how many requests are “in flight.”
-
-3. Request Timing (http_request_duration_seconds)
+#### 2. Request Duration Histogram (`http_request_duration_seconds`)
 
 ```python
 start = time.time()
@@ -43,52 +60,35 @@ REQUEST_LATENCY.labels(
     request.method, request.url.path, response.status_code
 ).observe(latency)
 ```
-- When?
 
-    1. Capture t_start just before handing control to FastAPI’s routing (call_next).
+- **When measured**: 
+  1. Capture `t_start` just before handing control to FastAPI's routing (`call_next`)
+  2. Capture `t_end` immediately after the route handler completes
+- **Histogram mechanics**: Each `.observe(latency)` call:
+  1. Increments the overall count by 1
+  2. Adds latency to the sum of all observations
+  3. Bumps every histogram bucket whose upper bound ≥ latency
+- **Use case**: Answer questions like "What's the 95th-percentile latency of all GET /data requests?"
 
-    2. Capture t_end immediately after the route handler (and any downstream middleware) completes.
+#### 3. Total Requests Counter (`http_requests_total`)
 
-- Histogram mechanics:
-
-    - Each .observe(latency) call:
-
-        1. Increments the overall count by 1.
-
-        2. Adds latency to the sum of all observations.
-
-        3. Bumps every histogram bucket whose upper bound ≥ latency.
-
-
-This lets us ask Prometheus questions like “What’s the 95th-percentile latency of all GET /data requests over the last 5 minutes?”
-
-4. Total Requests Counter (http_requests_total)
 ```python
 REQUEST_COUNT.labels(
     request.method, request.url.path, response.status_code
 ).inc()
 ```
-- When? Right after measuring latency, once you have the final response.status_code.
 
-- What it measures? A running total of requests, broken down by:
+- **When measured**: After measuring latency, once we have the final `response.status_code`
+- **What it tracks**: Running total of requests, broken down by:
+  - `method` (GET, POST, etc.)
+  - `endpoint` (the path, e.g., `/data`)
+  - `http_status` (200, 404, 500, etc.)
+- **How it works**: Each `.inc()` call adds exactly 1 to that three-dimensional counter
+- **Use case**: Chart or alert on patterns like "Number of POST /data requests returning 500 errors"
 
-    - method (GET, POST, etc.)
+### Complete HTTP Request Flow
 
-    - endpoint (the path, e.g. /data)
-
-    - http_status (200, 404, 500, etc.)
-
-- How? Each call to .inc() adds exactly 1 to that three-dimensional counter.
-
-- Result: You can chart or alert on things like
-
-    - “Number of POST /data requests returning 500 errors”
-
-    - “Rate of GET /data requests per second”
-
-5. Full Sequence Diagram
-
-```bash
+```
 Incoming HTTP request
          │
          ▼
@@ -98,7 +98,7 @@ metrics_middleware starts
   └─ response = await call_next(request)
          │
          ▼
-  Your actual route handler runs (DB calls, business logic…)
+  Our actual route handler runs (DB calls, business logic…)
          │
          ▼
 Back in metrics_middleware
@@ -108,55 +108,57 @@ Back in metrics_middleware
   └─ IN_PROGRESS.dec()
          │
          ▼
-Return `response` to client
+Return response to client
 ```
 
-> Middleware a built-in feature of FastAPI (via Starlette) that any function you register with is automatically injected around every single request. We don’t have to “pass” it into each route, FastAPI builds an ASGI middleware stack for you at application startup.
+> **Key Insight**: Middleware is a built-in feature of FastAPI (via Starlette) where any function you register is automatically injected around every single request. We don't have to "pass" it into each route—FastAPI builds an ASGI middleware stack automatically at application startup.
 
 ---
-## A simple explanation of how default metrics are being measured
 
-The core idea behind Prometheus’s default (process- and platform-level) metrics in our FastAPI app—what they are, how they get exposed, and why it’s done in a “fixed” (automatic) way:
+## Default System Metrics
 
-## 1. What the Default Metrics Are
+### What Are Default Metrics?
 
-When we install and import the Python Prometheus client, it automatically wires up two “collector” bundles that expose our application’s own runtime stats:
+When we install and import the Python Prometheus client, it automatically wires up two "collector" bundles that expose our application's runtime stats without any additional configuration.
 
-- Process metrics
+### Process Metrics
 
-    `process_cpu_seconds_total`: cumulative CPU time your Python process has used.
+These metrics provide insights into your Python process's resource usage:
 
-    `process_resident_memory_bytes`: how much RAM (RSS) the process is holding.
+- `process_cpu_seconds_total`: Cumulative CPU time your Python process has used
+- `process_resident_memory_bytes`: Current RAM (RSS) the process is holding
+- `process_virtual_memory_bytes`: Total virtual memory size
+- `process_open_fds` / `process_max_fds`: File descriptor counts and limits
+- `process_start_time_seconds`: Unix timestamp when the process began
 
-    `process_virtual_memory_bytes`: total virtual memory size.
+### Platform (Python Runtime) Metrics
 
-    `process_open_fds`, process_max_fds: file-descriptor counts.
+These metrics reveal Python-specific runtime behavior:
 
-    `process_start_time_seconds`: Unix timestamp when the process began.
+- `python_gc_objects_collected_total`: Objects reclaimed by garbage collection
+- `python_gc_collections_total`: How often the garbage collector has run
 
-- Platform (Python runtime) metrics
+### Auto-Registration Mechanism
 
-    `python_gc_objects_collected_total`, `python_gc_collections_total`: how often the garbage collector has run and how many objects it reclaimed.
+#### 1. Import-Time Setup
+The first time we `import prometheus_client`, the library automatically:
+- Creates a default registry
+- Registers built-in collectors for process and platform metrics
 
-We’ll see all of these automatically when we hit your /metrics endpoint—no extra code needed beyond importing the client.
+#### 2. Scrape-Time Data Collection
+When Prometheus scrapes `GET /metrics`:
+- The client iterates over every registered collector
+- Each collector runs its data-gathering code (reading from `/proc`, calling `os` or `gc` APIs)
+- Current values are collected in real-time
 
-## 2. How It Works “Under the Hood”
-1. Auto-registration on import
+#### 3. Text Output Generation
+Collected values are rendered into standard Prometheus text exposition format and returned.
 
-    The first time we import prometheus_client, the library’s startup code creates a default registry and registers its built-in collectors there.
+> **Performance Note**: This happens only when Prometheus actually scrapes—there's no background thread or polling cost inside our app, even if we never manually use these metrics in our code.
 
-2. Scrape-time data gathering
+### Default Metrics Collection Flow
 
-    When Prometheus scrapes GET /metrics, the client iterates over every registered collector. Each collector runs its small piece of code—reading from /proc, calling os or gc APIs, etc.—to gather the current values.
-
-3. Text output
-    
-    Those values are then rendered into the standard Prometheus text exposition format and returned to the caller.
-
-Because this all happens only when Prometheus actually scrapes, there’s no background thread or polling cost inside our app—even if we never manually observe those metrics in our code.
-
-## 3. Default Process & Platform Metrics Sequence
-```bash
+```
 Application startup
   └─ import prometheus_client                 
        ├─ auto-register ProcessCollector in REGISTRY
@@ -172,72 +174,82 @@ FastAPI /metrics endpoint
         └─ iterate over all registered collectors:
              • ProcessCollector.collect()   → sample CPU secs, RSS, VM size, fds, start time  
              • PlatformCollector.collect()  → sample Python GC counts, objects, etc  
-             • (plus any custom HTTP or DB metrics you’ve registered)  
+             • (plus any custom HTTP or DB metrics you've registered)  
    ↓
 Render text exposition format
    ↓
 Respond 200 + metrics payload → Prometheus ingests
 ```
 
-> The Prometheus client library auto-registers both the process and platform collectors when it’s imported. We see all of those metrics automatically when we/prometheus hit/hits our /metrics endpoint—no extra code needed beyond importing the client.
+> **Key Insight**: The Prometheus client library auto-registers both process and platform collectors when imported. We see all these metrics automatically when Prometheus hits our `/metrics` endpoint—no extra code needed beyond importing the client.
 
 ---
-## An explanation of how DB_QUERIES_TOTAL is counted and DB_QUERY_DURATION is measured conceptually.
 
-Every time our application runs a SQL statement, two things happen in our instrumentation:
+## Database Performance Monitoring
 
-1. Recording the start time
+### Overview
 
-In the before_cursor_execute hook we do:
-```bash
+Our application instruments every SQL query executed through SQLAlchemy, tracking both query counts and execution duration. This happens automatically through SQLAlchemy's event system.
+
+### Database Metrics
+
+#### Query Counter (`db_queries_total`)
+- **Type**: Counter with `operation` label (select, insert, update, delete)
+- **Purpose**: Track total number of queries by operation type
+- **Usage**: Identify query patterns and detect unusual database activity
+
+#### Query Duration (`db_query_duration_seconds`)
+- **Type**: Histogram with `operation` label
+- **Purpose**: Measure query execution time distribution
+- **Usage**: Find slow queries and monitor database performance trends
+
+#### Connection Pool Metrics
+- `db_pool_checked_out_connections`: Active connections in use
+- `db_pool_idle_connections`: Available connections waiting for use
+- `db_pool_waiters`: Threads waiting for a connection
+
+### Instrumentation Mechanics
+
+#### 1. Start Time Recording
+
+In the `before_cursor_execute` hook:
+```python
 context._query_start_time = time.time()
 ```
-That calls Python’s wall-clock timer (seconds since the epoch, as a floating-point number) and stashes it on the SQLAlchemy context.
 
-2. Measuring duration & incrementing counters
+This captures Python's wall-clock timer (seconds since epoch as float) and stores it on the SQLAlchemy context.
 
-In the after_cursor_execute hook we do:
-```bash
+#### 2. Duration Measurement & Counter Updates
+
+In the `after_cursor_execute` hook:
+```python
 duration = time.time() - context._query_start_time
 op = statement.strip().split()[0].lower()
 if op in ("select", "insert", "update", "delete"):
     DB_QUERIES_TOTAL.labels(operation=op).inc()
-    DB_QUERY_DURATION .labels(operation=op).observe(duration)
+    DB_QUERY_DURATION.labels(operation=op).observe(duration)
 ```
 
-`duration` is simply the difference between the end timestamp and the start timestamp measured in seconds as a float.
-`DB_QUERIES_TOTAL` is a Counter with one time-series per SQL operation.
-- Every time you call .inc(), it adds 1 to that operation’s running total.
-- Mathematically, if before you’d executed 42 SELECT queries, after .inc() it becomes 43.
-`DB_QUERY_DURATION` is a Histogram with one histogram per operation.
-- Under the hood it maintains:
-    - A sum of all observed durations:
-    - A count of observations:
-    - A set of cumulative bucket counts. 
+**Counter Logic**: `DB_QUERIES_TOTAL` maintains one time-series per SQL operation. Each `.inc()` call adds 1 to that operation's running total.
 
-- When we call .observe(duration), the library:
-    - Increments the sum by duration.
+**Histogram Logic**: `DB_QUERY_DURATION` maintains per-operation histograms. When calling `.observe(duration)`, the library:
+- Increments the sum by `duration`
+- Increments the count by 1  
+- Updates every bucket whose upper bound ≥ `duration`
 
-    - Increments the count by 1.
+### Database Instrumentation Flow
 
-    - Finds every bucket whose upper bound ≥ duration and increments its counter by 1.
-
-
-Whenever we use SQLAlchemy’s Engine or Session to run any SQL—whether via ORM methods (e.g. session.query(...)) or raw SQL calls (e.g. session.execute(text(...)))—under the hood SQLAlchemy goes through a common “cursor execution” workflow. The event hooks we’ve registered tap directly into that workflow, so we don’t have to sprinkle any special calls in your CRUD functions.
-
-3. DB Metrics Instrumentation Sequence
-
-```bash
+```
 Client
   ↓
 FastAPI endpoint handler (e.g. POST/GET → crud or session.execute)
   ↓
-SQLAlchemy Engine ── before_cursor_execute -──┐
-  │                                           │ record start time (t_start)
+SQLAlchemy Engine ── before_cursor_execute ────┐
+  │                                            │ record start time (t_start)
   └─> DBAPI cursor.execute(SQL, params) ──> PostgreSQL
-            ▲                                 │
-            │  result rows                  result
-            └── after_cursor_execute -────────┘
+            ▲                                  │
+            │  result rows                   result
+            └── after_cursor_execute ──────────┘
                 │
                 │ duration = now – t_start
                 │ op = first_keyword_of(SQL)
@@ -249,4 +261,45 @@ Result returned to FastAPI handler
 HTTP response sent back to Client
 ```
 
-> Exactly—any time our application goes through the SQLAlchemy Engine to run SQL, those two event hooks fire, regardless of which HTTP verb (GET, POST, PUT, DELETE) or part of our code is initiating it.
+> **Universal Coverage**: Any time our application goes through the SQLAlchemy Engine to run SQL, these event hooks fire automatically—regardless of HTTP method (GET, POST, PUT, DELETE) or which part of our code initiates the query.
+
+---
+
+## Implementation Details
+
+### Metrics Endpoint
+
+The `/metrics` endpoint serves Prometheus-formatted data and includes real-time connection pool statistics:
+
+```python
+@app.get("/metrics")
+def metrics():
+    # Update pool stats before scraping
+    status = engine.pool.status()
+    match = re.search(
+        r"Connections in use: (\d+).*Free connections: (\d+).*Waiting connections: (\d+)",
+        status,
+    )
+    if match:
+        in_use, free, waiting = map(int, match.groups())
+        DB_POOL_CHECKED_OUT.set(in_use)
+        DB_POOL_IDLE.set(free)
+        DB_POOL_WAITERS.set(waiting)
+
+    data = generate_latest()
+    return Response(data, media_type=CONTENT_TYPE_LATEST)
+```
+
+### Key Design Principles
+
+1. **Zero-Code Instrumentation**: HTTP and database metrics are collected automatically through middleware and event hooks
+2. **Minimal Performance Impact**: Metrics collection happens only during actual requests and database operations
+3. **Comprehensive Coverage**: Every HTTP request and database query is instrumented
+4. **Standard Prometheus Format**: All metrics follow Prometheus naming conventions and best practices
+
+### Monitoring Benefits
+
+- **Request Performance**: Track response times, error rates, and throughput
+- **Database Performance**: Monitor query patterns, slow queries, and connection pool health  
+- **System Health**: Observe CPU usage, memory consumption, and garbage collection
+- **Real-time Visibility**: All metrics available instantly via `/metrics` endpoint
