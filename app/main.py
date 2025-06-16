@@ -1,6 +1,8 @@
 import time
-from fastapi import FastAPI, Depends, HTTPException, Request, Response
+import re
 
+from fastapi import FastAPI, Depends, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from prometheus_client import (
     Counter,
     Histogram,
@@ -9,10 +11,9 @@ from prometheus_client import (
     CONTENT_TYPE_LATEST,
     REGISTRY,
 )
-
-from fastapi.responses import JSONResponse
+from sqlalchemy import text, event
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
-from sqlalchemy import text
 
 from . import crud, models, schemas
 from .database import SessionLocal, engine, Base
@@ -20,23 +21,61 @@ from .database import SessionLocal, engine, Base
 # Create tables
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="FastAPI Prometheus Demo")
+# ── FastAPI application ──────────────────────────────────────────
+app = FastAPI(title="FastAPI Performance Monitoring")
 
 # ── Metrics ───────────────────────────────────────────────────────
 REQUEST_COUNT = Counter(
     "http_requests_total",
     "Total HTTP requests",
-    ["method", "endpoint", "http_status"]
+    ["method", "endpoint", "http_status"],
 )
 REQUEST_LATENCY = Histogram(
     "http_request_duration_seconds",
     "HTTP request latency",
     ["method", "endpoint", "http_status"],
-    buckets=[0.1, 0.3, 0.5, 1, 3, 5]
+    buckets=[0.1, 0.3, 0.5, 1, 3, 5],
 )
 IN_PROGRESS = Gauge("inprogress_requests", "In-progress HTTP requests")
 
-# ── Register default process & platform collectors ────────────────
+# ── Default process & platform collectors are auto-registered by prometheus_client ──
+
+# ── DB-specific Metrics ───────────────────────────────────────────
+DB_QUERIES_TOTAL = Counter(
+    "db_queries_total",
+    "Total number of database queries executed",
+    ["operation"],  # select, insert, update, delete
+)
+DB_QUERY_DURATION = Histogram(
+    "db_query_duration_seconds",
+    "Duration of database queries in seconds",
+    ["operation"],
+)
+DB_POOL_CHECKED_OUT = Gauge(
+    "db_pool_checked_out_connections",
+    "Number of connections currently checked out from the pool",
+)
+DB_POOL_IDLE = Gauge(
+    "db_pool_idle_connections",
+    "Number of idle connections in the pool",
+)
+DB_POOL_WAITERS = Gauge(
+    "db_pool_waiters",
+    "Number of threads waiting for a connection",
+)
+
+# ── Instrument SQLAlchemy queries for DB metrics ───────────────────
+@event.listens_for(Engine, "before_cursor_execute")
+def before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+    context._query_start_time = time.time()
+
+@event.listens_for(Engine, "after_cursor_execute")
+def after_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+    duration = time.time() - context._query_start_time
+    op = statement.strip().split()[0].lower()
+    if op in ("select", "insert", "update", "delete"):
+        DB_QUERIES_TOTAL.labels(operation=op).inc()
+        DB_QUERY_DURATION.labels(operation=op).observe(duration)
 
 # ── DB Dependency ────────────────────────────────────────────────
 def get_db():
@@ -46,7 +85,7 @@ def get_db():
     finally:
         db.close()
 
-# ── Middleware for metrics ──────────────────────────────────────
+# ── Middleware for HTTP metrics ──────────────────────────────────
 @app.middleware("http")
 async def metrics_middleware(request: Request, call_next):
     IN_PROGRESS.inc()
@@ -63,7 +102,6 @@ async def metrics_middleware(request: Request, call_next):
 
     IN_PROGRESS.dec()
     return response
-
 
 # ── CRUD Endpoints ──────────────────────────────────────────────
 @app.post("/data", response_model=schemas.UserData, status_code=201)
@@ -91,23 +129,28 @@ def delete_data(item_id: int, db: Session = Depends(get_db)):
 # ── Prometheus metrics endpoint ─────────────────────────────────
 @app.get("/metrics")
 def metrics():
+    # Update pool stats before scraping
+    status = engine.pool.status()
+    match = re.search(
+        r"Connections in use: (\d+).*Free connections: (\d+).*Waiting connections: (\d+)",
+        status,
+    )
+    if match:
+        in_use, free, waiting = map(int, match.groups())
+        DB_POOL_CHECKED_OUT.set(in_use)
+        DB_POOL_IDLE.set(free)
+        DB_POOL_WAITERS.set(waiting)
+
     data = generate_latest()
     return Response(data, media_type=CONTENT_TYPE_LATEST)
 
-# ── health check ─────────────────────────────────
+# ── Health check ─────────────────────────────────────────────────
 @app.get("/health", tags=["health"])
 async def health_check(db: Session = Depends(get_db)):
-    """
-    Simple health endpoint.
-    - Checks the app is alive.
-    - Verifies DB connectivity by running a trivial query.
-    """
     try:
-        # run a minimal query to verify DB is up
-        db.execute(text("SELECT 1")) # it attempts to execute a raw string SELECT 1, which is no longer allowed in SQLAlchemy v2.0.
+        db.execute(text("SELECT 1"))
         return {"status": "ok", "database": "reachable"}
     except Exception as e:
-        # on failure, return 500 with details
         return JSONResponse(
             status_code=500,
             content={"status": "error", "database": "unreachable", "detail": str(e)},
