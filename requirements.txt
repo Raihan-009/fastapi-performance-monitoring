@@ -6,3 +6,5 @@ prometheus_client
 pytest
 httpx
 email-validator
+prometheus_client
+psutil

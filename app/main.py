@@ -5,6 +5,10 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
+import threading, time
+import psutil
+from prometheus_client import Gauge
+
 from . import crud, models, schemas
 from .database import SessionLocal, engine, Base
 
@@ -53,6 +57,29 @@ async def metrics_middleware(request: Request, call_next):
     IN_PROGRESS.dec()
     return response
 
+# ── custom CPU & memory gauges ──────────────────────────────────
+APP_CPU_PERCENT = Gauge(
+    "app_cpu_usage_percent", "App process CPU usage percent"
+)
+APP_RSS_BYTES = Gauge(
+    "app_resident_memory_bytes", "App process resident memory (RSS) in bytes"
+)
+
+def collect_process_metrics():
+    proc = psutil.Process()
+    while True:
+        APP_CPU_PERCENT.set(psutil.cpu_percent(interval=None))
+        APP_RSS_BYTES.set(proc.memory_info().rss)
+        time.sleep(5)
+
+@app.on_event("startup")
+async def start_metrics_collector():
+    thread = threading.Thread(
+        target=collect_process_metrics, daemon=True
+    )
+    thread.start()
+
+    
 # ── CRUD Endpoints ──────────────────────────────────────────────
 @app.post("/data", response_model=schemas.UserData, status_code=201)
 def create_data(data: schemas.UserDataCreate, db: Session = Depends(get_db)):
