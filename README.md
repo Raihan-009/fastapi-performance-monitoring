@@ -155,6 +155,30 @@ We’ll see all of these automatically when we hit your /metrics endpoint—no e
 
 Because this all happens only when Prometheus actually scrapes, there’s no background thread or polling cost inside our app—even if we never manually observe those metrics in our code.
 
+## 3. Default Process & Platform Metrics Sequence
+```bash
+Application startup
+  └─ import prometheus_client                 
+       ├─ auto-register ProcessCollector in REGISTRY
+       └─ auto-register PlatformCollector in REGISTRY
+
+…our app runs, doing DB calls, HTTP middleware, etc…
+
+Prometheus scraper
+  GET http://app:8000/metrics
+   ↓
+FastAPI /metrics endpoint
+   └─ generate_latest()
+        └─ iterate over all registered collectors:
+             • ProcessCollector.collect()   → sample CPU secs, RSS, VM size, fds, start time  
+             • PlatformCollector.collect()  → sample Python GC counts, objects, etc  
+             • (plus any custom HTTP or DB metrics you’ve registered)  
+   ↓
+Render text exposition format
+   ↓
+Respond 200 + metrics payload → Prometheus ingests
+```
+
 > The Prometheus client library auto-registers both the process and platform collectors when it’s imported. We see all of those metrics automatically when we/prometheus hit/hits our /metrics endpoint—no extra code needed beyond importing the client.
 
 ---
@@ -200,5 +224,29 @@ if op in ("select", "insert", "update", "delete"):
 
 
 Whenever we use SQLAlchemy’s Engine or Session to run any SQL—whether via ORM methods (e.g. session.query(...)) or raw SQL calls (e.g. session.execute(text(...)))—under the hood SQLAlchemy goes through a common “cursor execution” workflow. The event hooks we’ve registered tap directly into that workflow, so we don’t have to sprinkle any special calls in your CRUD functions.
+
+3. DB Metrics Instrumentation Sequence
+
+```bash
+Client
+  ↓
+FastAPI endpoint handler (e.g. POST/GET → crud or session.execute)
+  ↓
+SQLAlchemy Engine ── before_cursor_execute -──┐
+  │                                           │ record start time (t_start)
+  └─> DBAPI cursor.execute(SQL, params) ──> PostgreSQL
+            ▲                                 │
+            │  result rows                  result
+            └── after_cursor_execute -────────┘
+                │
+                │ duration = now – t_start
+                │ op = first_keyword_of(SQL)
+                ├─> DB_QUERIES_TOTAL.labels(op).inc()
+                └─> DB_QUERY_DURATION.labels(op).observe(duration)
+  ↓
+Result returned to FastAPI handler
+  ↓
+HTTP response sent back to Client
+```
 
 > Exactly—any time our application goes through the SQLAlchemy Engine to run SQL, those two event hooks fire, regardless of which HTTP verb (GET, POST, PUT, DELETE) or part of our code is initiating it.
