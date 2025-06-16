@@ -1,0 +1,60 @@
+# ── HTTP Metrics ──────────────────────────────────────────────────
+# 1. Global request rate
+rate(http_requests_total[5m])
+
+# 2. Rate of POST /data
+rate(http_requests_total{endpoint="/data",method="POST"}[5m])
+
+# 3. 95th percentile latency of GET /data
+histogram_quantile(
+  0.95, 
+  sum(rate(http_request_duration_seconds_bucket{endpoint="/data",method="GET"}[5m]))
+    by (le)
+)
+
+# ── DB Query Metrics ───────────────────────────────────────────────
+# 4. Rate of SELECT queries
+rate(db_queries_total{operation="select"}[5m])
+
+# 5. Rate of INSERT queries
+rate(db_queries_total{operation="insert"}[5m])
+
+# 6. 95th percentile SELECT latency
+histogram_quantile(
+  0.95,
+  sum(rate(db_query_duration_seconds_bucket{operation="select"}[5m]))
+    by (le)
+)
+
+# 7. 99th percentile INSERT latency
+histogram_quantile(
+  0.99,
+  sum(rate(db_query_duration_seconds_bucket{operation="insert"}[5m]))
+    by (le)
+)
+
+# ── Connection Pool Metrics ────────────────────────────────────────
+# 8. Current checked-out connections
+db_pool_checked_out_connections
+
+# 9. Current idle connections
+db_pool_idle_connections
+
+# 10. Current waiters
+db_pool_waiters
+
+# ── Default Process & Platform Metrics ────────────────────────────
+# 11. CPU usage rate
+rate(process_cpu_seconds_total[5m])
+
+# 12. Resident memory in bytes
+process_resident_memory_bytes
+
+# 13. Virtual memory in bytes
+process_virtual_memory_bytes
+
+# 14. Total GC collections
+python_gc_collections_total
+
+# 15. Total GC objects collected
+python_gc_objects_collected_total
